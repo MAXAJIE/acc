@@ -1,0 +1,25 @@
+# Dealer OS — Local Deploy
+
+## 1. Install
+```bash
+bun install    # or npm install
+```
+
+## 2. Env
+Copy `.env.example` to `.env` and set your Supabase project URL / publishable key.
+For the admin (bootstrap) flow set `SUPABASE_SERVICE_ROLE_KEY` server-side.
+
+## 3. Database
+Apply migrations in `supabase/migrations/` plus the two extra SQL files in `db-manual/`
+(financial reports + documents) via `supabase db push` or the SQL editor.
+
+## 4. Run
+```bash
+bun run dev
+```
+Open http://localhost:8080
+
+## First user
+The first signed-in user can click **Make me a dealer** to claim the
+`dealer_admin` role (no PIN required — the server just checks that no dealer
+exists yet).

@@ -14,7 +14,9 @@ export const bootstrapDealer = createServerFn({ method: "POST" })
     const { data, error } = await (context.supabase as any).rpc("claim_first_dealer_admin");
     if (error) {
       if (error.message.includes("claim_first_dealer_admin")) {
-        throw new Error("Run local-supabase-bootstrap.sql once, then try Make me dealer again.");
+        throw new Error(
+          "Run supabase db push so the local dealer bootstrap migration is installed, then try Make me dealer again.",
+        );
       }
       throw new Error(error.message);
     }
@@ -28,7 +30,7 @@ export const bootstrapDealer = createServerFn({ method: "POST" })
  */
 export const grantAgentRole = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ user_id: z.string().uuid() }).parse(d))
+  .validator((d: unknown) => z.object({ user_id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
     const { data: isDealer } = await context.supabase.rpc("has_role", {
       _user_id: context.userId,
@@ -84,7 +86,7 @@ export const getSettings = createServerFn({ method: "GET" }).handler(async () =>
 
 export const updateSettings = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) =>
+  .validator((d: unknown) =>
     z.object({
       default_commission_percent: z.number().min(0).max(100),
       aging_alert_days: z.number().int().min(1).max(365),

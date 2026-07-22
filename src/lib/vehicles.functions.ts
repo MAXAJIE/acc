@@ -82,7 +82,7 @@ const vehicleSchema = z.object({
 
 export const createVehicle = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => vehicleSchema.parse(d))
+  .validator(vehicleSchema)
   .handler(async ({ data, context }) => {
     if (!(await isDealer(context.supabase, context.userId))) throw new Error("Forbidden");
     const { data: row, error } = await context.supabase
@@ -96,9 +96,7 @@ export const createVehicle = createServerFn({ method: "POST" })
 
 export const updateVehicle = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) =>
-    z.object({ id: z.string().uuid(), patch: vehicleSchema.partial() }).parse(d),
-  )
+  .validator(z.object({ id: z.string().uuid(), patch: vehicleSchema.partial() }))
   .handler(async ({ data, context }) => {
     if (!(await isDealer(context.supabase, context.userId))) throw new Error("Forbidden");
     const { data: row, error } = await context.supabase
@@ -113,7 +111,7 @@ export const updateVehicle = createServerFn({ method: "POST" })
 
 export const deleteVehicle = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
+  .validator(z.object({ id: z.string().uuid() }))
   .handler(async ({ data, context }) => {
     if (!(await isDealer(context.supabase, context.userId))) throw new Error("Forbidden");
     const { error } = await context.supabase.from("vehicles").delete().eq("id", data.id);
@@ -125,9 +123,7 @@ export const deleteVehicle = createServerFn({ method: "POST" })
 
 export const togglePublicLink = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: unknown) =>
-    z.object({ id: z.string().uuid(), enable: z.boolean() }).parse(d),
-  )
+  .validator(z.object({ id: z.string().uuid(), enable: z.boolean() }))
   .handler(async ({ data, context }) => {
     if (!(await isDealer(context.supabase, context.userId))) throw new Error("Forbidden");
     const publicId = data.enable ? crypto.randomUUID() : null;
@@ -150,7 +146,7 @@ const PUB_ALLOWED = [
 ] as const;
 
 export const getPublicVehicle = createServerFn({ method: "GET" })
-  .inputValidator((d: unknown) => z.object({ publicId: z.string().uuid() }).parse(d))
+  .validator(z.object({ publicId: z.string().uuid() }))
   .handler(async ({ data }) => {
     const { createClient } = await import("@supabase/supabase-js");
     const { url, publishableKey: key } = requireSupabasePublicEnv();

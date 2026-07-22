@@ -1,0 +1,282 @@
+diff -ruN a/.env.example b/.env.example
+--- a/.env.example	1970-01-01 00:00:00.000000000 +0000
++++ b/.env.example	2026-07-21 16:49:32.596211669 +0000
+@@ -0,0 +1,7 @@
++SUPABASE_PROJECT_ID="your-project-ref"
++SUPABASE_URL="https://your-project-ref.supabase.co"
++SUPABASE_PUBLISHABLE_KEY="sb_publishable_your_key"
++
++VITE_SUPABASE_PROJECT_ID="your-project-ref"
++VITE_SUPABASE_URL="https://your-project-ref.supabase.co"
++VITE_SUPABASE_PUBLISHABLE_KEY="sb_publishable_your_key"
+\ No newline at end of file
+diff -ruN a/README.md b/README.md
+--- a/README.md	2026-07-21 16:49:32.508298886 +0000
++++ b/README.md	2026-07-21 16:49:32.596092442 +0000
+@@ -18,9 +18,25 @@
+ git clone <this-repository-url>
+ cd <repository-name>
+ npm i
++cp .env.example .env
+ npm run dev
+ ```
+
++## Supabase configuration
++
++All Supabase project values come from `.env`, so changing projects only means editing `.env` and relinking the CLI.
++
++1. Copy `.env.example` to `.env`.
++2. Set `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `VITE_SUPABASE_URL`, and `VITE_SUPABASE_PUBLISHABLE_KEY` for your project.
++3. Link the CLI to the same project, then push migrations:
++
++```sh
++supabase link --project-ref <your-project-ref>
++supabase db push
++```
++
++The app does not need `SUPABASE_SERVICE_ROLE_KEY` for local login or the first dealer bootstrap. After signing in, click **Make me the dealer**; the timestamped migration installs the required `claim_first_dealer_admin()` function.
++
+ ## Built with
+
+ - TanStack Start
+diff -ruN a/local-supabase-bootstrap.sql b/local-supabase-bootstrap.sql
+--- a/local-supabase-bootstrap.sql	2026-07-21 16:49:32.513117761 +0000
++++ b/local-supabase-bootstrap.sql	1970-01-01 00:00:00.000000000 +0000
+@@ -1,46 +0,0 @@
+--- Run once in your database SQL editor to allow local first-admin bootstrap
+--- without putting SUPABASE_SERVICE_ROLE_KEY in .env.
+-
+-CREATE OR REPLACE FUNCTION public.claim_first_dealer_admin()
+-RETURNS boolean
+-LANGUAGE plpgsql
+-SECURITY DEFINER
+-SET search_path = public
+-AS $$
+-DECLARE
+-  _user_id uuid := auth.uid();
+-BEGIN
+-  IF _user_id IS NULL THEN
+-    RAISE EXCEPTION 'Unauthorized';
+-  END IF;
+-
+-  LOCK TABLE public.user_roles IN EXCLUSIVE MODE;
+-
+-  IF EXISTS (
+-    SELECT 1
+-    FROM public.user_roles
+-    WHERE role = 'dealer_admin'
+-  ) THEN
+-    RETURN false;
+-  END IF;
+-
+-  INSERT INTO public.user_roles (user_id, role)
+-  VALUES (_user_id, 'dealer_admin')
+-  ON CONFLICT (user_id, role) DO NOTHING;
+-
+-  RETURN true;
+-END;
+-$$;
+-
+-REVOKE ALL ON FUNCTION public.claim_first_dealer_admin() FROM public, anon;
+-GRANT EXECUTE ON FUNCTION public.claim_first_dealer_admin() TO authenticated;
+-
+-DROP POLICY IF EXISTS "dealer grants agent roles" ON public.user_roles;
+-
+-CREATE POLICY "dealer grants agent roles"
+-  ON public.user_roles
+-  FOR INSERT TO authenticated
+-  WITH CHECK (
+-    role = 'agent'
+-    AND public.has_role(auth.uid(), 'dealer_admin')
+-  );
+\ No newline at end of file
+diff -ruN a/src/integrations/supabase/env.ts b/src/integrations/supabase/env.ts
+--- a/src/integrations/supabase/env.ts	2026-07-21 16:49:32.498689814 +0000
++++ b/src/integrations/supabase/env.ts	2026-07-21 16:49:32.586068054 +0000
+@@ -1,24 +1,30 @@
+-const DEFAULT_SUPABASE_URL = "https://xvijbmcpqfmjbujspzlc.supabase.co";
+-const DEFAULT_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_WZgeuQO2YC4PxDcOnegh7A_Pw8yfkiy";
++function readEnv(...names: string[]) {
++  const processEnv = typeof process !== "undefined" ? process.env : undefined;
++  const viteEnv = import.meta.env as Record<string, string | undefined>;
++
++  for (const name of names) {
++    const value = processEnv?.[name] ?? viteEnv?.[name];
++    if (value) return value;
++  }
++
++  return undefined;
++}
+
+ export function getSupabaseUrl() {
+-  return (
+-    (typeof process !== "undefined" ? process.env.SUPABASE_URL : undefined) ||
+-    import.meta.env.VITE_SUPABASE_URL ||
+-    DEFAULT_SUPABASE_URL
+-  );
++  return readEnv("SUPABASE_URL", "VITE_SUPABASE_URL");
+ }
+
+ export function getSupabasePublishableKey() {
+-  return (
+-    (typeof process !== "undefined" ? process.env.SUPABASE_PUBLISHABLE_KEY : undefined) ||
+-    import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+-    DEFAULT_SUPABASE_PUBLISHABLE_KEY
++  return readEnv(
++    "SUPABASE_PUBLISHABLE_KEY",
++    "SUPABASE_ANON_KEY",
++    "VITE_SUPABASE_PUBLISHABLE_KEY",
++    "VITE_SUPABASE_ANON_KEY",
+   );
+ }
+
+ export function getSupabaseServiceRoleKey() {
+-  return typeof process !== "undefined" ? process.env.SUPABASE_SERVICE_ROLE_KEY : undefined;
++  return readEnv("SUPABASE_SERVICE_ROLE_KEY");
+ }
+
+ export function requireSupabasePublicEnv() {
+@@ -28,9 +34,13 @@
+   if (!url || !publishableKey) {
+     const missing = [
+       ...(!url ? ["SUPABASE_URL or VITE_SUPABASE_URL"] : []),
+-      ...(!publishableKey ? ["SUPABASE_PUBLISHABLE_KEY or VITE_SUPABASE_PUBLISHABLE_KEY"] : []),
++      ...(!publishableKey
++        ? ["SUPABASE_PUBLISHABLE_KEY or VITE_SUPABASE_PUBLISHABLE_KEY"]
++        : []),
+     ];
+-    const message = `Missing Supabase environment variable(s): ${missing.join(", ")}. Add them to your local .env.`;
++    const message = `Missing Supabase environment variable(s): ${missing.join(
++      ", ",
++    )}. Copy .env.example to .env and set your project URL and publishable key.`;
+     console.error(`[Supabase] ${message}`);
+     throw new Error(message);
+   }
+@@ -47,7 +57,9 @@
+       ...(!url ? ["SUPABASE_URL or VITE_SUPABASE_URL"] : []),
+       ...(!serviceRoleKey ? ["SUPABASE_SERVICE_ROLE_KEY"] : []),
+     ];
+-    const message = `Missing Supabase environment variable(s): ${missing.join(", ")}. Add SUPABASE_SERVICE_ROLE_KEY only for privileged local admin tasks.`;
++    const message = `Missing Supabase environment variable(s): ${missing.join(
++      ", ",
++    )}. SUPABASE_SERVICE_ROLE_KEY is only needed for privileged admin scripts; normal local login and first-dealer bootstrap do not require it.`;
+     console.error(`[Supabase] ${message}`);
+     throw new Error(message);
+   }
+diff -ruN a/src/lib/admin.functions.ts b/src/lib/admin.functions.ts
+--- a/src/lib/admin.functions.ts	2026-07-21 16:49:32.503719246 +0000
++++ b/src/lib/admin.functions.ts	2026-07-21 16:49:32.591032637 +0000
+@@ -14,7 +14,9 @@
+     const { data, error } = await (context.supabase as any).rpc("claim_first_dealer_admin");
+     if (error) {
+       if (error.message.includes("claim_first_dealer_admin")) {
+-        throw new Error("Run local-supabase-bootstrap.sql once, then try Make me dealer again.");
++        throw new Error(
++          "Run supabase db push so the local dealer bootstrap migration is installed, then try Make me dealer again.",
++        );
+       }
+       throw new Error(error.message);
+     }
+diff -ruN a/src/routes/auth.tsx b/src/routes/auth.tsx
+--- a/src/routes/auth.tsx	2026-07-21 16:49:32.577019832 +0000
++++ b/src/routes/auth.tsx	2026-07-21 16:49:32.610412405 +0000
+@@ -9,6 +9,10 @@
+     meta: [
+       { title: "Sign in — Dealer OS" },
+       { name: "description", content: "Sign in or create your Dealer OS account." },
++      { property: "og:title", content: "Sign in — Dealer OS" },
++      { property: "og:description", content: "Sign in or create your Dealer OS account." },
++      { property: "og:type", content: "website" },
++      { name: "twitter:card", content: "summary" },
+       { name: "robots", content: "noindex" },
+     ],
+   }),
+diff -ruN a/src/routes/index.tsx b/src/routes/index.tsx
+--- a/src/routes/index.tsx	2026-07-21 16:49:32.576762971 +0000
++++ b/src/routes/index.tsx	2026-07-21 16:49:32.610276397 +0000
+@@ -13,6 +13,13 @@
+         name: "description",
+         content: "Sign in to Dealer OS: cash flow, inventory and agent commissions for one dealership.",
+       },
++      { property: "og:title", content: "Dealer OS — dealership console" },
++      {
++        property: "og:description",
++        content: "Cash flow, inventory and agent commissions for one dealership.",
++      },
++      { property: "og:type", content: "website" },
++      { name: "twitter:card", content: "summary" },
+     ],
+   }),
+   component: Landing,
+diff -ruN a/src/routes/v.$publicId.tsx b/src/routes/v.$publicId.tsx
+--- a/src/routes/v.$publicId.tsx	2026-07-21 16:49:32.577240956 +0000
++++ b/src/routes/v.$publicId.tsx	2026-07-21 16:49:32.610629075 +0000
+@@ -11,6 +11,10 @@
+     meta: [
+       { title: "Vehicle — Dealer OS" },
+       { name: "description", content: "Vehicle details shared by the dealership." },
++      { property: "og:title", content: "Vehicle — Dealer OS" },
++      { property: "og:description", content: "Vehicle details shared by the dealership." },
++      { property: "og:type", content: "website" },
++      { name: "twitter:card", content: "summary" },
+     ],
+   }),
+   component: PublicVehicle,
+diff -ruN a/supabase/config.toml b/supabase/config.toml
+--- a/supabase/config.toml	2026-07-21 16:49:32.504828825 +0000
++++ b/supabase/config.toml	2026-07-21 16:49:32.606570281 +0000
+@@ -1 +1 @@
+-project_id = "lzeaovrdczklfjrbmbkz"
++project_id = "dealer-os"
+\ No newline at end of file
+diff -ruN a/supabase/migrations/20260721072000_local_dealer_bootstrap.sql b/supabase/migrations/20260721072000_local_dealer_bootstrap.sql
+--- a/supabase/migrations/20260721072000_local_dealer_bootstrap.sql	1970-01-01 00:00:00.000000000 +0000
++++ b/supabase/migrations/20260721072000_local_dealer_bootstrap.sql	2026-07-21 16:49:32.614346406 +0000
+@@ -0,0 +1,46 @@
++-- Optional manual SQL copy of supabase/migrations/20260721072000_local_dealer_bootstrap.sql.
++-- Prefer `supabase db push`; paste this file in the SQL editor only if you are not using migrations.
++
++CREATE OR REPLACE FUNCTION public.claim_first_dealer_admin()
++RETURNS boolean
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  _user_id uuid := auth.uid();
++BEGIN
++  IF _user_id IS NULL THEN
++    RAISE EXCEPTION 'Unauthorized';
++  END IF;
++
++  LOCK TABLE public.user_roles IN EXCLUSIVE MODE;
++
++  IF EXISTS (
++    SELECT 1
++    FROM public.user_roles
++    WHERE role = 'dealer_admin'
++  ) THEN
++    RETURN false;
++  END IF;
++
++  INSERT INTO public.user_roles (user_id, role)
++  VALUES (_user_id, 'dealer_admin')
++  ON CONFLICT (user_id, role) DO NOTHING;
++
++  RETURN true;
++END;
++$$;
++
++REVOKE ALL ON FUNCTION public.claim_first_dealer_admin() FROM public, anon;
++GRANT EXECUTE ON FUNCTION public.claim_first_dealer_admin() TO authenticated;
++
++DROP POLICY IF EXISTS "dealer grants agent roles" ON public.user_roles;
++
++CREATE POLICY "dealer grants agent roles"
++  ON public.user_roles
++  FOR INSERT TO authenticated
++  WITH CHECK (
++    role = 'agent'
++    AND public.has_role(auth.uid(), 'dealer_admin')
++  );
+\ No newline at end of file

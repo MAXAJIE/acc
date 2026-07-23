@@ -3,23 +3,24 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { z } from "zod";
 
 /**
- * Bootstrap route: if NO dealer_admin exists in the whole app, allow the
- * calling user to claim the role. Otherwise deny. Uses supabaseAdmin because
- * user_roles is not readable across users under RLS.
+ * Bootstrap: if NO dealer_admin exists yet, calling user claims the role.
+ * Backed by SECURITY DEFINER RPC `public.bootstrap_dealer()` so no
+ * service_role key is required. The dealer keeps the role until they
+ * voluntarily resign via `resignDealer`.
  */
 export const bootstrapDealer = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { count, error: countError } = await supabaseAdmin
-      .from("user_roles")
-      .select("*", { head: true, count: "exact" })
-      .eq("role", "dealer_admin");
-    if (countError) throw new Error(countError.message);
-    if ((count ?? 0) > 0) throw new Error("A dealer already exists.");
-    const { error } = await supabaseAdmin
-      .from("user_roles")
-      .insert({ user_id: context.userId, role: "dealer_admin" });
+    const { error } = await context.supabase.rpc("bootstrap_dealer" as any);
+    if (error) throw new Error(error.message);
+    return { ok: true };
+  });
+
+/** Dealer voluntarily gives up their dealer_admin role. */
+export const resignDealer = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { error } = await context.supabase.rpc("resign_dealer" as any);
     if (error) throw new Error(error.message);
     return { ok: true };
   });
@@ -32,16 +33,10 @@ export const grantAgentRole = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ user_id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
-    const { data: isDealer } = await context.supabase.rpc("has_role", {
-      _user_id: context.userId,
-      _role: "dealer_admin",
+    const { error } = await context.supabase.rpc("grant_agent_role" as any, {
+      _user_id: data.user_id,
     });
-    if (!isDealer) throw new Error("Forbidden");
-    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    const { error } = await supabaseAdmin
-      .from("user_roles")
-      .insert({ user_id: data.user_id, role: "agent" });
-    if (error && !error.message.includes("duplicate")) throw new Error(error.message);
+    if (error) throw new Error(error.message);
     return { ok: true };
   });
 
@@ -55,10 +50,12 @@ export const getMyRole = createServerFn({ method: "GET" })
       .eq("user_id", context.userId);
     if (error) throw new Error(error.message);
     const roles = (data ?? []).map((r: { role: string }) => r.role);
+    const { data: dealerExists } = await context.supabase.rpc("dealer_exists" as any);
     return {
       userId: context.userId,
       is_dealer: roles.includes("dealer_admin"),
       is_agent: roles.includes("agent"),
+      dealer_exists: dealerExists === true,
       roles,
     };
   });

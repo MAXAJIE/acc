@@ -1,5 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_PUBLISHABLE_KEY } from "@/integrations/supabase/public-config";
 import { z } from "zod";
 
 /**
@@ -63,8 +64,8 @@ export const getMyRole = createServerFn({ method: "GET" })
 /** App settings (public read via anon, dealer-only update). */
 export const getSettings = createServerFn({ method: "GET" }).handler(async () => {
   const { createClient } = await import("@supabase/supabase-js");
-  const key = process.env.SUPABASE_PUBLISHABLE_KEY!;
-  const url = process.env.SUPABASE_URL!;
+  const key = process.env.SUPABASE_PUBLISHABLE_KEY || PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+  const url = process.env.SUPABASE_URL || PUBLIC_SUPABASE_URL;
   const client = createClient(url, key, {
     auth: { persistSession: false, autoRefreshToken: false, storage: undefined },
     global: {

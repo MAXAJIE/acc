@@ -152,8 +152,9 @@ export const getPublicVehicle = createServerFn({ method: "GET" })
   .inputValidator((d: unknown) => z.object({ publicId: z.string().uuid() }).parse(d))
   .handler(async ({ data }) => {
     const { createClient } = await import("@supabase/supabase-js");
-    const key = process.env.SUPABASE_PUBLISHABLE_KEY!;
-    const url = process.env.SUPABASE_URL!;
+    const { PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_PUBLISHABLE_KEY } = await import("@/integrations/supabase/public-config");
+    const key = process.env.SUPABASE_PUBLISHABLE_KEY || PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    const url = process.env.SUPABASE_URL || PUBLIC_SUPABASE_URL;
     const client = createClient(url, key, {
       auth: { persistSession: false, autoRefreshToken: false, storage: undefined },
       global: {

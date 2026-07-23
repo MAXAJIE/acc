@@ -1,520 +1,300 @@
---- /dev/null	2026-07-23 07:31:28.106570637 +0000
-+++ b/src/lib/invites.functions.ts	2026-07-23 07:43:25.484507777 +0000
-@@ -0,0 +1,50 @@
-+import { createServerFn } from "@tanstack/react-start";
-+import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
-+import { z } from "zod";
-+
-+/** Dealer generates a new unique invitation code. */
-+export const createInvite = createServerFn({ method: "POST" })
-+  .middleware([requireSupabaseAuth])
-+  .handler(async ({ context }) => {
-+    const { data, error } = await context.supabase.rpc("create_agent_invite" as any);
-+    if (error) throw new Error(error.message);
-+    return { code: data as string };
-+  });
-+
-+/** Dealer lists invites they created. */
-+export const listInvites = createServerFn({ method: "GET" })
-+  .middleware([requireSupabaseAuth])
-+  .handler(async ({ context }) => {
-+    const { data, error } = await context.supabase
-+      .from("agent_invites" as any)
-+      .select("*")
-+      .order("created_at", { ascending: false });
-+    if (error) throw new Error(error.message);
-+    return data ?? [];
-+  });
-+
-+/** Dealer revokes an unused invitation code. */
-+export const revokeInvite = createServerFn({ method: "POST" })
-+  .middleware([requireSupabaseAuth])
-+  .inputValidator((d: unknown) => z.object({ code: z.string().min(1) }).parse(d))
-+  .handler(async ({ data, context }) => {
-+    const { error } = await context.supabase.rpc("revoke_agent_invite" as any, {
-+      _code: data.code,
-+    });
-+    if (error) throw new Error(error.message);
-+    return { ok: true };
-+  });
-+
-+/** Any authenticated user redeems an invitation code to become an agent. */
-+export const redeemInvite = createServerFn({ method: "POST" })
-+  .middleware([requireSupabaseAuth])
-+  .inputValidator((d: unknown) =>
-+    z.object({ code: z.string().trim().min(1) }).parse(d),
-+  )
-+  .handler(async ({ data, context }) => {
-+    const { error } = await context.supabase.rpc("redeem_agent_invite" as any, {
-+      _code: data.code,
-+    });
-+    if (error) throw new Error(error.message);
-+    return { ok: true };
-+  });
---- /dev/null	2026-07-23 07:31:28.106570637 +0000
-+++ b/db-manual/04_agent_invites.sql	2026-07-23 07:43:25.484392779 +0000
-@@ -0,0 +1,168 @@
-+-- Run once in Supabase SQL editor.
-+-- Adds agent invitation codes so dealer owners can invite workers as agents
-+-- without needing SUPABASE_SERVICE_ROLE_KEY. Each code is unique and carries
-+-- the owner's user id, which becomes the agent's dealer_owner_id upon redeem
-+-- (forward-compatible with future multi-owner support).
-+
-+-- ---------- table ----------
-+create table if not exists public.agent_invites (
-+  id uuid primary key default gen_random_uuid(),
-+  code text not null unique,
-+  created_by uuid not null references auth.users(id) on delete cascade,
-+  created_at timestamptz not null default now(),
-+  used_by uuid references auth.users(id) on delete set null,
-+  used_at timestamptz,
-+  revoked_at timestamptz
-+);
-+
-+grant select, insert, update, delete on public.agent_invites to authenticated;
-+grant all on public.agent_invites to service_role;
-+
-+alter table public.agent_invites enable row level security;
-+
-+drop policy if exists "invites: dealer reads own" on public.agent_invites;
-+create policy "invites: dealer reads own"
-+  on public.agent_invites for select to authenticated
-+  using (created_by = auth.uid() and public.has_role(auth.uid(), 'dealer_admin'));
-+
-+drop policy if exists "invites: dealer inserts own" on public.agent_invites;
-+create policy "invites: dealer inserts own"
-+  on public.agent_invites for insert to authenticated
-+  with check (created_by = auth.uid() and public.has_role(auth.uid(), 'dealer_admin'));
-+
-+drop policy if exists "invites: dealer revokes own" on public.agent_invites;
-+create policy "invites: dealer revokes own"
-+  on public.agent_invites for update to authenticated
-+  using (created_by = auth.uid() and public.has_role(auth.uid(), 'dealer_admin'))
-+  with check (created_by = auth.uid());
-+
-+-- Optional: track which dealer owns each agent (future multi-owner ready).
-+create table if not exists public.agent_owners (
-+  user_id uuid primary key references auth.users(id) on delete cascade,
-+  owner_id uuid not null references auth.users(id) on delete cascade,
-+  created_at timestamptz not null default now()
-+);
-+grant select on public.agent_owners to authenticated;
-+grant all on public.agent_owners to service_role;
-+alter table public.agent_owners enable row level security;
-+
-+drop policy if exists "agent_owners: self or owner reads" on public.agent_owners;
-+create policy "agent_owners: self or owner reads"
-+  on public.agent_owners for select to authenticated
-+  using (user_id = auth.uid() or owner_id = auth.uid());
-+
-+-- ---------- dealer_exists (SECURITY DEFINER) ----------
-+create or replace function public.dealer_exists()
-+returns boolean
-+language sql
-+stable
-+security definer
-+set search_path = public
-+as $$
-+  select exists(select 1 from public.user_roles where role = 'dealer_admin');
-+$$;
-+revoke all on function public.dealer_exists() from public;
-+grant execute on function public.dealer_exists() to authenticated;
-+
-+-- ---------- create_agent_invite ----------
-+create or replace function public.create_agent_invite()
-+returns text
-+language plpgsql
-+security definer
-+set search_path = public
-+as $$
-+declare
-+  v_uid uuid := auth.uid();
-+  v_code text;
-+  v_try int := 0;
-+begin
-+  if v_uid is null then
-+    raise exception 'Not authenticated';
-+  end if;
-+  if not public.has_role(v_uid, 'dealer_admin') then
-+    raise exception 'Forbidden';
-+  end if;
-+
-+  loop
-+    v_try := v_try + 1;
-+    -- 10-char uppercase alphanumeric, unambiguous
-+    v_code := upper(translate(
-+      substr(encode(gen_random_bytes(8), 'base64'), 1, 10),
-+      '+/=OIl01',
-+      'ABCDEFGH'
-+    ));
-+    begin
-+      insert into public.agent_invites(code, created_by) values (v_code, v_uid);
-+      return v_code;
-+    exception when unique_violation then
-+      if v_try > 5 then raise; end if;
-+    end;
-+  end loop;
-+end;
-+$$;
-+revoke all on function public.create_agent_invite() from public;
-+grant execute on function public.create_agent_invite() to authenticated;
-+
-+-- ---------- revoke_agent_invite ----------
-+create or replace function public.revoke_agent_invite(_code text)
-+returns void
-+language plpgsql
-+security definer
-+set search_path = public
-+as $$
-+declare v_uid uuid := auth.uid();
-+begin
-+  if v_uid is null then raise exception 'Not authenticated'; end if;
-+  update public.agent_invites
-+     set revoked_at = now()
-+   where code = _code and created_by = v_uid and used_at is null;
-+end;
-+$$;
-+revoke all on function public.revoke_agent_invite(text) from public;
-+grant execute on function public.revoke_agent_invite(text) to authenticated;
-+
-+-- ---------- redeem_agent_invite ----------
-+create or replace function public.redeem_agent_invite(_code text)
-+returns void
-+language plpgsql
-+security definer
-+set search_path = public
-+as $$
-+declare
-+  v_uid uuid := auth.uid();
-+  v_owner uuid;
-+begin
-+  if v_uid is null then raise exception 'Not authenticated'; end if;
-+
-+  select created_by into v_owner
-+    from public.agent_invites
-+   where code = _code
-+     and used_at is null
-+     and revoked_at is null
-+   for update;
-+
-+  if v_owner is null then
-+    raise exception 'Invalid or already used invitation code';
-+  end if;
-+
-+  if v_owner = v_uid then
-+    raise exception 'Cannot redeem your own invitation code';
-+  end if;
-+
-+  insert into public.user_roles(user_id, role)
-+    values (v_uid, 'agent')
-+    on conflict do nothing;
-+
-+  insert into public.agent_owners(user_id, owner_id)
-+    values (v_uid, v_owner)
-+    on conflict (user_id) do update set owner_id = excluded.owner_id;
-+
-+  update public.agent_invites
-+     set used_by = v_uid, used_at = now()
-+   where code = _code;
-+end;
-+$$;
-+revoke all on function public.redeem_agent_invite(text) from public;
-+grant execute on function public.redeem_agent_invite(text) to authenticated;
-+
-+notify pgrst, 'reload schema';
---- a/src/lib/admin.functions.ts
-+++ b/src/lib/admin.functions.ts
-@@ -50,10 +50,12 @@
-       .eq("user_id", context.userId);
-     if (error) throw new Error(error.message);
-     const roles = (data ?? []).map((r: { role: string }) => r.role);
-+    const { data: dealerExists } = await context.supabase.rpc("dealer_exists" as any);
-     return {
-       userId: context.userId,
-       is_dealer: roles.includes("dealer_admin"),
-       is_agent: roles.includes("agent"),
-+      dealer_exists: dealerExists === true,
-       roles,
-     };
-   });
---- a/src/routes/_authenticated/route.tsx
-+++ b/src/routes/_authenticated/route.tsx
-@@ -4,7 +4,9 @@
- import { useQuery } from "@tanstack/react-query";
- import { useServerFn } from "@tanstack/react-start";
- import { getMyRole, bootstrapDealer } from "@/lib/admin.functions";
-+import { redeemInvite } from "@/lib/invites.functions";
- import { useI18n } from "@/lib/i18n";
-+import { useState } from "react";
- import { toast } from "sonner";
- 
- export const Route = createFileRoute("/_authenticated")({
-@@ -21,10 +23,13 @@
-   const { t } = useI18n();
-   const fetchRole = useServerFn(getMyRole);
-   const bootstrap = useServerFn(bootstrapDealer);
-+  const doRedeem = useServerFn(redeemInvite);
-   const { data, isLoading, refetch } = useQuery({
-     queryKey: ["my-role"],
-     queryFn: () => fetchRole(),
-   });
-+  const [code, setCode] = useState("");
-+  const [busy, setBusy] = useState(false);
- 
-   if (isLoading) {
-     return (
-@@ -36,6 +41,7 @@
- 
-   const isDealer = !!data?.is_dealer;
-   const isAgent = !!data?.is_agent;
-+  const dealerExists = !!data?.dealer_exists;
-   const hasRole = isDealer || isAgent;
- 
-   if (!hasRole) {
-@@ -43,21 +49,59 @@
-       <div className="flex min-h-screen items-center justify-center bg-background px-4 text-foreground">
-         <div className="w-full max-w-md rounded-2xl border border-border bg-card p-6 shadow-sm">
-           <h2 className="text-lg font-semibold">{t("role")}</h2>
--          <p className="mt-2 text-sm text-muted-foreground">{t("no_role_yet")}</p>
--          <button
--            onClick={async () => {
--              try {
--                await bootstrap();
--                toast.success(t("saved"));
--                refetch();
--              } catch (e) {
--                toast.error((e as Error).message);
--              }
--            }}
--            className="mt-4 w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
--          >
--            {t("make_me_dealer")}
--          </button>
-+
-+          {dealerExists ? (
-+            <>
-+              <p className="mt-2 text-sm text-muted-foreground">
-+                {t("enter_invite_hint")}
-+              </p>
-+              <div className="mt-4 space-y-2">
-+                <input
-+                  value={code}
-+                  onChange={(e) => setCode(e.target.value.toUpperCase())}
-+                  placeholder={t("invite_code_placeholder")}
-+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono tracking-widest"
-+                  autoFocus
-+                />
-+                <button
-+                  disabled={busy || !code.trim()}
-+                  onClick={async () => {
-+                    setBusy(true);
-+                    try {
-+                      await doRedeem({ data: { code: code.trim() } });
-+                      toast.success(t("saved"));
-+                      refetch();
-+                    } catch (e) {
-+                      toast.error((e as Error).message);
-+                    } finally {
-+                      setBusy(false);
-+                    }
-+                  }}
-+                  className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
-+                >
-+                  {t("be_an_agent")}
-+                </button>
-+              </div>
-+            </>
-+          ) : (
-+            <>
-+              <p className="mt-2 text-sm text-muted-foreground">{t("no_role_yet")}</p>
-+              <button
-+                onClick={async () => {
-+                  try {
-+                    await bootstrap();
-+                    toast.success(t("saved"));
-+                    refetch();
-+                  } catch (e) {
-+                    toast.error((e as Error).message);
-+                  }
-+                }}
-+                className="mt-4 w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-+              >
-+                {t("make_me_dealer")}
-+              </button>
-+            </>
-+          )}
-         </div>
-       </div>
-     );
---- a/src/routes/_authenticated/settings.tsx
-+++ b/src/routes/_authenticated/settings.tsx
-@@ -1,7 +1,8 @@
- import { createFileRoute, useNavigate } from "@tanstack/react-router";
- import { useQuery, useQueryClient } from "@tanstack/react-query";
- import { useServerFn } from "@tanstack/react-start";
--import { getSettings, updateSettings, resignDealer } from "@/lib/admin.functions";
-+import { getSettings, updateSettings, resignDealer, getMyRole } from "@/lib/admin.functions";
-+import { createInvite, listInvites, revokeInvite } from "@/lib/invites.functions";
- import { supabase } from "@/integrations/supabase/client";
- import { useI18n } from "@/lib/i18n";
- import { useEffect, useState } from "react";
-@@ -12,13 +13,24 @@
- });
- 
- function SettingsPage() {
--  const { t } = useI18n();
-+  const { t, lang } = useI18n();
-   const qc = useQueryClient();
-   const navigate = useNavigate();
-   const fetchS = useServerFn(getSettings);
-   const doUpdate = useServerFn(updateSettings);
-   const doResign = useServerFn(resignDealer);
-+  const fetchRole = useServerFn(getMyRole);
-+  const doCreateInvite = useServerFn(createInvite);
-+  const fetchInvites = useServerFn(listInvites);
-+  const doRevokeInvite = useServerFn(revokeInvite);
-   const { data } = useQuery({ queryKey: ["settings"], queryFn: () => fetchS() });
-+  const { data: role } = useQuery({ queryKey: ["my-role"], queryFn: () => fetchRole() });
-+  const isDealer = !!role?.is_dealer;
-+  const { data: invites, refetch: refetchInvites } = useQuery({
-+    queryKey: ["invites"],
-+    queryFn: () => fetchInvites(),
-+    enabled: isDealer,
-+  });
-   const [pct, setPct] = useState(20);
-   const [days, setDays] = useState(60);
- 
-@@ -75,6 +87,87 @@
-         </button>
-       </div>
- 
-+      {isDealer && (
-+        <div className="rounded-2xl border border-border bg-card p-6">
-+          <h3 className="text-sm font-semibold">{t("invitations")}</h3>
-+          <p className="mt-1 text-xs text-muted-foreground">{t("invitations_hint")}</p>
-+          <button
-+            onClick={async () => {
-+              try {
-+                const res = await doCreateInvite();
-+                toast.success(res.code);
-+                refetchInvites();
-+              } catch (e) {
-+                toast.error((e as Error).message);
-+              }
-+            }}
-+            className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90"
-+          >
-+            {t("generate_invite")}
-+          </button>
-+
-+          <div className="mt-4 divide-y divide-border overflow-hidden rounded-md border border-border">
-+            {(invites ?? []).length === 0 && (
-+              <div className="p-3 text-xs text-muted-foreground">—</div>
-+            )}
-+            {(invites ?? []).map((inv: any) => {
-+              const status = inv.revoked_at
-+                ? t("invite_revoked")
-+                : inv.used_at
-+                ? t("invite_used")
-+                : t("invite_active");
-+              const badgeCls = inv.revoked_at
-+                ? "bg-muted text-muted-foreground"
-+                : inv.used_at
-+                ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
-+                : "bg-primary/10 text-primary";
-+              return (
-+                <div
-+                  key={inv.id}
-+                  className="flex flex-wrap items-center gap-3 p-3 text-sm"
-+                >
-+                  <span className="font-mono tracking-widest">{inv.code}</span>
-+                  <span
-+                    className={`rounded-full px-2 py-0.5 text-xs font-medium ${badgeCls}`}
-+                  >
-+                    {status}
-+                  </span>
-+                  <span className="ml-auto text-xs text-muted-foreground">
-+                    {new Date(inv.created_at).toLocaleDateString(
-+                      lang === "zh" ? "zh-CN" : "en-US",
-+                    )}
-+                  </span>
-+                  <button
-+                    onClick={() => {
-+                      navigator.clipboard.writeText(inv.code);
-+                      toast.success(t("copy_code"));
-+                    }}
-+                    className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted"
-+                  >
-+                    {t("copy_code")}
-+                  </button>
-+                  {!inv.used_at && !inv.revoked_at && (
-+                    <button
-+                      onClick={async () => {
-+                        try {
-+                          await doRevokeInvite({ data: { code: inv.code } });
-+                          refetchInvites();
-+                        } catch (e) {
-+                          toast.error((e as Error).message);
-+                        }
-+                      }}
-+                      className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
-+                    >
-+                      {t("invite_revoke")}
-+                    </button>
-+                  )}
-+                </div>
-+              );
-+            })}
-+          </div>
-+        </div>
-+      )}
-+
-       <div className="rounded-2xl border border-destructive/30 bg-card p-6">
-         <h3 className="text-sm font-semibold text-destructive">{t("resign_dealer")}</h3>
-         <p className="mt-1 text-xs text-muted-foreground">{t("confirm_resign_dealer")}</p>
---- a/src/lib/i18n.tsx
-+++ b/src/lib/i18n.tsx
-@@ -87,6 +87,21 @@
-     make_me_dealer: "Make me the dealer (only allowed if none exists yet)",
-     resign_dealer: "Resign as dealer",
-     confirm_resign_dealer: "Give up your dealer role? You will lose owner access until another dealer re-assigns it.",
-+    be_an_agent: "Be an agent",
-+    enter_invite_hint: "A dealer already runs this workspace. Enter the invitation code they gave you to join as an agent.",
-+    invite_code_placeholder: "INVITATION CODE",
-+    invitations: "Agent invitations",
-+    invitations_hint: "Generate a unique code for each new agent. Each code can only be used once.",
-+    generate_invite: "Generate invitation code",
-+    invite_code: "Code",
-+    invite_status: "Status",
-+    invite_created: "Created",
-+    invite_used_by: "Used by",
-+    invite_active: "Active",
-+    invite_used: "Used",
-+    invite_revoked: "Revoked",
-+    invite_revoke: "Revoke",
-+    copy_code: "Copy code",
+diff --git a/dealer-os/src/lib/i18n.tsx b/dealer-os/src/lib/i18n.tsx
+index 5c24110..d296e99 100644
+--- a/dealer-os/src/lib/i18n.tsx
++++ b/dealer-os/src/lib/i18n.tsx
+@@ -94,14 +94,12 @@ const dict = {
+     invitations_hint: "Generate a unique code for each new agent. Each code can only be used once.",
+     generate_invite: "Generate invitation code",
+     invite_code: "Code",
+-    invite_status: "Status",
+     invite_created: "Created",
+-    invite_used_by: "Used by",
+-    invite_active: "Active",
+-    invite_used: "Used",
+-    invite_revoked: "Revoked",
+-    invite_revoke: "Revoke",
++    invite_delete: "Delete",
++    invite_deleted: "Invitation code deleted",
+     copy_code: "Copy code",
++    code_copied: "Code copied to clipboard",
++    copy_failed: "Copy failed",
      photos_label: "Photos",
      price: "Price",
      condition: "Condition",
-@@ -193,6 +208,21 @@
-     make_me_dealer: "把我设为老板(仅在还没有老板时允许)",
-     resign_dealer: "辞去老板身份",
-     confirm_resign_dealer: "确认放弃老板身份?在其他老板重新指派之前你将失去管理权限。",
-+    be_an_agent: "以销售员身份加入",
-+    enter_invite_hint: "这个工作区已有老板。请输入老板给你的邀请码,以销售员身份加入。",
-+    invite_code_placeholder: "邀请码",
-+    invitations: "销售员邀请码",
-+    invitations_hint: "为每一位新销售员生成一个唯一邀请码,每个邀请码只能使用一次。",
-+    generate_invite: "生成邀请码",
-+    invite_code: "邀请码",
-+    invite_status: "状态",
-+    invite_created: "生成时间",
-+    invite_used_by: "使用者",
-+    invite_active: "可用",
-+    invite_used: "已使用",
-+    invite_revoked: "已撤销",
-+    invite_revoke: "撤销",
-+    copy_code: "复制邀请码",
+@@ -215,14 +213,12 @@ const dict = {
+     invitations_hint: "为每一位新销售员生成一个唯一邀请码,每个邀请码只能使用一次。",
+     generate_invite: "生成邀请码",
+     invite_code: "邀请码",
+-    invite_status: "状态",
+     invite_created: "生成时间",
+-    invite_used_by: "使用者",
+-    invite_active: "可用",
+-    invite_used: "已使用",
+-    invite_revoked: "已撤销",
+-    invite_revoke: "撤销",
++    invite_delete: "删除",
++    invite_deleted: "邀请码已删除",
+     copy_code: "复制邀请码",
++    code_copied: "邀请码已复制",
++    copy_failed: "复制失败",
      photos_label: "照片",
      price: "价格",
      condition: "车况",
+diff --git a/dealer-os/src/lib/invites.functions.ts b/dealer-os/src/lib/invites.functions.ts
+index 41c596f..5efd679 100644
+--- a/dealer-os/src/lib/invites.functions.ts
++++ b/dealer-os/src/lib/invites.functions.ts
+@@ -2,40 +2,80 @@ import { createServerFn } from "@tanstack/react-start";
+ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+ import { z } from "zod";
+ 
+-/** Dealer generates a new unique invitation code. */
++/**
++ * In-memory rate limiter: 2 requests per 10 seconds per user.
++ * Note: state is per-isolate, which is acceptable for a light abuse guard.
++ */
++const RATE_LIMIT_WINDOW_MS = 10_000;
++const RATE_LIMIT_MAX = 2;
++const createInviteHits = new Map<string, number[]>();
++
++function checkRateLimit(userId: string) {
++  const now = Date.now();
++  const hits = (createInviteHits.get(userId) ?? []).filter(
++    (t) => now - t < RATE_LIMIT_WINDOW_MS,
++  );
++  if (hits.length >= RATE_LIMIT_MAX) {
++    const retryIn = Math.ceil(
++      (RATE_LIMIT_WINDOW_MS - (now - hits[0])) / 1000,
++    );
++    throw new Error(
++      `Too many requests. Please wait ${retryIn}s before generating another code.`,
++    );
++  }
++  hits.push(now);
++  createInviteHits.set(userId, hits);
++}
++
++/** Dealer generates a new unique invitation code (rate-limited: 2 per 10s). */
+ export const createInvite = createServerFn({ method: "POST" })
+   .middleware([requireSupabaseAuth])
+   .handler(async ({ context }) => {
+-    const { data, error } = await context.supabase.rpc("create_agent_invite" as any);
++    checkRateLimit(context.userId);
++    const { data, error } = await context.supabase.rpc(
++      "create_agent_invite" as any,
++    );
+     if (error) throw new Error(error.message);
+     return { code: data as string };
+   });
+ 
+-/** Dealer lists invites they created. */
++/** Dealer lists their active (unused, unrevoked) invitation codes. */
+ export const listInvites = createServerFn({ method: "GET" })
+   .middleware([requireSupabaseAuth])
+   .handler(async ({ context }) => {
+     const { data, error } = await context.supabase
+       .from("agent_invites" as any)
+       .select("*")
++      .is("used_at", null)
++      .is("revoked_at", null)
+       .order("created_at", { ascending: false });
+     if (error) throw new Error(error.message);
+     return data ?? [];
+   });
+ 
+-/** Dealer revokes an unused invitation code. */
+-export const revokeInvite = createServerFn({ method: "POST" })
++/** Dealer hard-deletes an invitation code. */
++export const deleteInvite = createServerFn({ method: "POST" })
+   .middleware([requireSupabaseAuth])
+   .inputValidator((d: unknown) => z.object({ code: z.string().min(1) }).parse(d))
+   .handler(async ({ data, context }) => {
+-    const { error } = await context.supabase.rpc("revoke_agent_invite" as any, {
+-      _code: data.code,
+-    });
++    const { supabaseAdmin } = await import(
++      "@/integrations/supabase/client.server"
++    );
++    // Scope deletion to the caller's own invites.
++    const { error } = await supabaseAdmin
++      .from("agent_invites" as any)
++      .delete()
++      .eq("code", data.code)
++      .eq("dealer_id", context.userId);
+     if (error) throw new Error(error.message);
+     return { ok: true };
+   });
+ 
+-/** Any authenticated user redeems an invitation code to become an agent. */
++/**
++ * Any authenticated user redeems an invitation code to become an agent.
++ * The invite row is deleted after a successful redemption so it doesn't
++ * linger as clutter.
++ */
+ export const redeemInvite = createServerFn({ method: "POST" })
+   .middleware([requireSupabaseAuth])
+   .inputValidator((d: unknown) =>
+@@ -46,5 +86,12 @@ export const redeemInvite = createServerFn({ method: "POST" })
+       _code: data.code,
+     });
+     if (error) throw new Error(error.message);
++    const { supabaseAdmin } = await import(
++      "@/integrations/supabase/client.server"
++    );
++    await supabaseAdmin
++      .from("agent_invites" as any)
++      .delete()
++      .eq("code", data.code);
+     return { ok: true };
+   });
+diff --git a/dealer-os/src/routes/_authenticated/settings.tsx b/dealer-os/src/routes/_authenticated/settings.tsx
+index 6d8e4d4..69d14ed 100644
+--- a/dealer-os/src/routes/_authenticated/settings.tsx
++++ b/dealer-os/src/routes/_authenticated/settings.tsx
+@@ -2,7 +2,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useServerFn } from "@tanstack/react-start";
+ import { getSettings, updateSettings, resignDealer, getMyRole } from "@/lib/admin.functions";
+-import { createInvite, listInvites, revokeInvite } from "@/lib/invites.functions";
++import { createInvite, listInvites, deleteInvite } from "@/lib/invites.functions";
+ import { supabase } from "@/integrations/supabase/client";
+ import { useI18n } from "@/lib/i18n";
+ import { useEffect, useState } from "react";
+@@ -12,6 +12,31 @@ export const Route = createFileRoute("/_authenticated/settings")({
+   component: SettingsPage,
+ });
+ 
++async function copyToClipboard(text: string) {
++  try {
++    if (navigator.clipboard && window.isSecureContext) {
++      await navigator.clipboard.writeText(text);
++      return true;
++    }
++  } catch {
++    // fall through to legacy fallback
++  }
++  try {
++    const ta = document.createElement("textarea");
++    ta.value = text;
++    ta.style.position = "fixed";
++    ta.style.opacity = "0";
++    document.body.appendChild(ta);
++    ta.focus();
++    ta.select();
++    const ok = document.execCommand("copy");
++    document.body.removeChild(ta);
++    return ok;
++  } catch {
++    return false;
++  }
++}
++
+ function SettingsPage() {
+   const { t, lang } = useI18n();
+   const qc = useQueryClient();
+@@ -22,7 +47,7 @@ function SettingsPage() {
+   const fetchRole = useServerFn(getMyRole);
+   const doCreateInvite = useServerFn(createInvite);
+   const fetchInvites = useServerFn(listInvites);
+-  const doRevokeInvite = useServerFn(revokeInvite);
++  const doDeleteInvite = useServerFn(deleteInvite);
+   const { data } = useQuery({ queryKey: ["settings"], queryFn: () => fetchS() });
+   const { data: role } = useQuery({ queryKey: ["my-role"], queryFn: () => fetchRole() });
+   const isDealer = !!role?.is_dealer;
+@@ -110,60 +135,43 @@ function SettingsPage() {
+             {(invites ?? []).length === 0 && (
+               <div className="p-3 text-xs text-muted-foreground">—</div>
+             )}
+-            {(invites ?? []).map((inv: any) => {
+-              const status = inv.revoked_at
+-                ? t("invite_revoked")
+-                : inv.used_at
+-                ? t("invite_used")
+-                : t("invite_active");
+-              const badgeCls = inv.revoked_at
+-                ? "bg-muted text-muted-foreground"
+-                : inv.used_at
+-                ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+-                : "bg-primary/10 text-primary";
+-              return (
+-                <div
+-                  key={inv.id}
+-                  className="flex flex-wrap items-center gap-3 p-3 text-sm"
+-                >
+-                  <span className="font-mono tracking-widest">{inv.code}</span>
+-                  <span
+-                    className={`rounded-full px-2 py-0.5 text-xs font-medium ${badgeCls}`}
+-                  >
+-                    {status}
+-                  </span>
+-                  <span className="ml-auto text-xs text-muted-foreground">
+-                    {new Date(inv.created_at).toLocaleDateString(
+-                      lang === "zh" ? "zh-CN" : "en-US",
+-                    )}
+-                  </span>
+-                  <button
+-                    onClick={() => {
+-                      navigator.clipboard.writeText(inv.code);
+-                      toast.success(t("copy_code"));
+-                    }}
+-                    className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted"
+-                  >
+-                    {t("copy_code")}
+-                  </button>
+-                  {!inv.used_at && !inv.revoked_at && (
+-                    <button
+-                      onClick={async () => {
+-                        try {
+-                          await doRevokeInvite({ data: { code: inv.code } });
+-                          refetchInvites();
+-                        } catch (e) {
+-                          toast.error((e as Error).message);
+-                        }
+-                      }}
+-                      className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+-                    >
+-                      {t("invite_revoke")}
+-                    </button>
++            {(invites ?? []).map((inv: any) => (
++              <div
++                key={inv.id}
++                className="flex flex-wrap items-center gap-3 p-3 text-sm"
++              >
++                <span className="font-mono tracking-widest">{inv.code}</span>
++                <span className="ml-auto text-xs text-muted-foreground">
++                  {new Date(inv.created_at).toLocaleDateString(
++                    lang === "zh" ? "zh-CN" : "en-US",
+                   )}
+-                </div>
+-              );
+-            })}
++                </span>
++                <button
++                  onClick={async () => {
++                    const ok = await copyToClipboard(inv.code);
++                    if (ok) toast.success(t("code_copied"));
++                    else toast.error(t("copy_failed"));
++                  }}
++                  className="rounded-md border border-border px-2 py-1 text-xs hover:bg-muted"
++                >
++                  {t("copy_code")}
++                </button>
++                <button
++                  onClick={async () => {
++                    try {
++                      await doDeleteInvite({ data: { code: inv.code } });
++                      toast.success(t("invite_deleted"));
++                      refetchInvites();
++                    } catch (e) {
++                      toast.error((e as Error).message);
++                    }
++                  }}
++                  className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
++                >
++                  {t("invite_delete")}
++                </button>
++              </div>
++            ))}
+           </div>
+         </div>
+       )}
